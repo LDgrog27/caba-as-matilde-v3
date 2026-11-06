@@ -2,7 +2,8 @@
    accion: login | listar | estado | crear | eliminar
    Se entra con ADMIN_PASSWORD; la sesión es un token firmado que dura 12 h. */
 import crypto from 'node:crypto';
-import { getDb, hoyMx, esFecha, diasEntre, hayConflicto, correo, json } from './_lib.js';
+import { getDb, hoyMx, esFecha, diasEntre, hayConflicto, correo, json, token, baseUrl } from './_lib.js';
+import { sincronizar, urlOk, PLAT } from './_ical.js';
 import { correoEstado } from './_emails.js';
 
 const clave = () => (process.env.ADMIN_PASSWORD || '') + '|' + (process.env.RESERVAS_SECRET || '');
@@ -51,6 +52,7 @@ export default async (req, res) => {
       const snap = await ref.get();
       if (!snap.exists) return json(res, 404, { error: 'No existe esa reserva.' });
       const r = snap.data();
+      if (r.tipo === 'externa') return json(res, 400, { error: 'Esta reserva viene de Airbnb/Booking: se cambia allá.' });
       const estado = b.estado;
       if (!['confirmada', 'rechazada', 'cancelada'].includes(estado)) return json(res, 400, { error: 'Estado no válido.' });
       if (estado === 'confirmada' && await hayConflicto(db, r.cabana, r.entrada, r.salida, snap.id)) {
@@ -85,6 +87,35 @@ export default async (req, res) => {
       r.creada = new Date().toISOString();
       await db.collection('reservas').add(r);
       return json(res, 200, { ok: true });
+    }
+
+    if (b.accion === 'ical_leer') {
+      const cfg = (await db.collection('config').doc('ical').get()).data() || {};
+      const ids = (Array.isArray(b.cabanas) ? b.cabanas : []).filter((c) => /^[a-z0-9-]{1,60}$/.test(c));
+      const enlaces = Object.fromEntries(ids.map((c) => [c, Object.fromEntries(PLAT.map((p) => [p, `${baseUrl(req)}/api/ical?cabana=${c}&para=${p}&t=${token(c, 'ical')}`]))]));
+      return json(res, 200, { ok: true, cabanas: cfg.cabanas || {}, sync: cfg.sync || '', resumen: cfg.resumen || [], enlaces });
+    }
+
+    if (b.accion === 'ical_guardar') {
+      const ref = db.collection('config').doc('ical');
+      const cfg = (await ref.get()).data() || {};
+      const nuevo = {};
+      for (const [c, u] of Object.entries(b.cabanas || {})) {
+        if (!/^[a-z0-9-]{1,60}$/.test(c)) continue;
+        nuevo[c] = {};
+        for (const p of PLAT) {
+          const v = txt(u && u[p], 800);
+          if (v && !urlOk(v)) return json(res, 400, { error: 'El enlace de ' + p + ' debe empezar con https://' });
+          if (v) nuevo[c][p] = v;
+        }
+      }
+      await ref.set({ ...cfg, cabanas: nuevo });
+      return json(res, 200, { ok: true });
+    }
+
+    if (b.accion === 'ical_sync') {
+      const resumen = await sincronizar(db);
+      return json(res, 200, { ok: true, resumen });
     }
 
     if (b.accion === 'eliminar') {
